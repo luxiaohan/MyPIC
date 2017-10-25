@@ -1,0 +1,448 @@
+#include <fstream>
+#include <iostream>
+#include <iomanip>
+#include <cstdlib>
+#include <cstdio>
+#include <fftw3.h>
+#include <ctime>
+#include <algorithm>
+#include <omp.h>
+#include "Pic2d.h"
+#include "Pic3d.h"
+#include "MyFunc.h"
+#include <gsl/gsl_sf_bessel.h>
+using namespace std;
+
+const double epsilon=8.854187818e-12;//unit: F/m
+const double macrocharge=1.602176565e-19,macromass=1.672621777e-27;
+
+int main(int argc,char** argv)
+{
+  int t1,t2;
+  t1=time(NULL);
+  int 	 numofgridx=64;
+  int  	 numofgridy=64;
+  int	 numofgridz=32;
+
+  double MSta=938.272046;
+  double numofCharge=1;
+  double numofMass  =1;
+
+  double emitx=1e-10,alphax=0,betax=1;
+  double emity=1e-10,alphay=0,betay=1;
+  double emitz=1e-10,alphaz=0,betaz=1;
+
+  double KneticE=0.035;	//MeV
+  double dw=0;
+  double Egamma=1.0+KneticE/MSta,     Ebeta=sqrt(1-1.0/Egamma/Egamma);
+  double speed=Ebeta*C_light;
+
+  string rfqPath;
+  double timeNow=0;
+  double frq=325e6;
+  int 	 maxStepNumberPerCycle=100;
+  double steptime= 1.0/frq/maxStepNumberPerCycle;
+  int	 maxStepNumber=1e6;
+
+  int 	 particlenumber=1000;
+  double current = 0.0;
+  bool	 spaceChargeFlag=false;
+  double hugenum=1.0;
+  
+  double elelength=1;
+  //Input from txt
+  ifstream input("input.txt");
+  if(!input.is_open())
+  {
+    cout<<"input.txt cannot read in"<<endl;
+    return 0;
+  }
+
+  string inputline;
+  vector<string> inputStrVec;
+  while(input.peek()!=EOF)
+  {
+    getline	(input	  ,	inputline  );
+    StringSplit	(inputline,	inputStrVec);
+    if(inputStrVec.empty())  continue;
+    transform	(inputStrVec[0].begin(),inputStrVec[0].end(), inputStrVec[0].begin(), ::tolower);
+    if(inputStrVec[0]=="numofgrid")
+    {
+      numofgridx	=	stoi(inputStrVec[1]);
+      numofgridy	=	stoi(inputStrVec[2]);
+      numofgridz	=	stoi(inputStrVec[3]);
+    }
+    else if(inputStrVec[0]=="particle")
+    {
+      numofCharge	=	stod(inputStrVec[1]);
+      numofMass		=	stod(inputStrVec[2]);
+    }
+    else if(inputStrVec[0]=="twissx")
+    {
+      emitx		=	stod(inputStrVec[1]);
+      betax		=	stod(inputStrVec[2]);
+      alphax		=	stod(inputStrVec[3]);
+    }
+    else if(inputStrVec[0]=="twissy")
+    {
+      emity		=	stod(inputStrVec[1]);
+      betay		=	stod(inputStrVec[2]);
+      alphay		=	stod(inputStrVec[3]);
+    }
+    else if(inputStrVec[0]=="twissz")
+    {
+      emitz		=	stod(inputStrVec[1]);
+      betaz		=	stod(inputStrVec[2]);
+      alphaz		=	stod(inputStrVec[3]);
+    }
+    else if(inputStrVec[0]=="particlenumber")
+    {
+      particlenumber	=	stoi(inputStrVec[1]);
+    }
+    else if(inputStrVec[0]=="energy")
+    {
+      KneticE		=	stod(inputStrVec[1]);	//MeV
+      dw		=	stod(inputStrVec[2]); 
+    }
+    else if(inputStrVec[0]=="current")
+    {
+      current		=	stod(inputStrVec[1]);
+      if(inputStrVec[1]=="0"||current<1e-12)
+      {
+	spaceChargeFlag	=	false;
+      }
+      else
+      {
+	spaceChargeFlag	=	true;
+      }
+    }
+    else if(inputStrVec[0]=="rfq")
+    {
+      frq		=	stod(inputStrVec[1]);
+      //elelength 	=	stod(inputStrVec[2]);
+      //rfqPath		=	inputStrVec[3];
+    }
+    else if(inputStrVec[0]=="steppercycle")
+    {
+      maxStepNumberPerCycle=	stoi(inputStrVec[1]);
+    }
+    else if(inputStrVec[0]=="maxstepnumber")
+    {
+      maxStepNumber	=	stod(inputStrVec[1]);
+    }
+    else
+    {
+      cout<<"error, unknown item in input file"<<endl;
+    }
+
+  }
+
+  if(spaceChargeFlag)
+    hugenum		=	current  / frq  / particlenumber / (numofCharge*_Q); 
+  else
+    hugenum		=	1;
+    
+  if(particlenumber==1)
+    cout<<"Total charge= "<<hugenum * particlenumber * (numofCharge*_Q)<<endl;
+
+  steptime		=	1.0/frq/maxStepNumberPerCycle;
+  cout<<"TimeStep=  "<<steptime<<endl;
+
+  Egamma		=	1.0+KneticE/(MSta*numofCharge);
+  Ebeta			=	sqrt(1-1.0/Egamma/Egamma);
+  speed			=	Ebeta*C_light;
+  //double Egamma=1.0005,     Ebeta=sqrt(1-1.0/Egamma/Egamma);
+
+  double err=-1e-8;
+  double slice=100*(1+err);
+
+  fftw_init_threads();
+  PIC3D acc1(particlenumber,numofgridx,numofgridy,numofgridz,steptime,hugenum,frq);
+  //particle number,  grid number,  timestep,  Initial gamma,   Huge number
+  srand(234);
+  if(0)
+  {
+    /*
+  double emitx=1e-6;
+  double emity=1e-6;
+  double rxinitial=0.002;
+  double ryinitial=0.002;
+  acc1.ReadParticle(vector<double>{
+      emitx*speed,  pow(rxinitial*2,2)/emitx/speed,	0, 
+      emity*speed,  pow(ryinitial*2,2)/emity/speed,	0});
+      */
+  }
+  else if(emitz<1e-9)
+  {
+  acc1.ReadParticle(vector<double>{
+      emitx/(Ebeta*Egamma)*4,	betax,		alphax,
+      emity/(Ebeta*Egamma)*4,	betay,		alphay}
+      ,Egamma,dw,speed/frq);
+      cout<<"emitz=0"<<endl;
+  }
+  else if(1)
+  {
+    acc1.ReadParticle(vector<double>{
+	emitx/(Ebeta*Egamma)*4,		betax,		alphax,
+	emity/(Ebeta*Egamma)*4,		betay,		alphay,
+	emitz/(Ebeta*pow(Egamma,3))*4,	betaz,		alphaz
+	}
+	,Egamma);
+  }
+  elelength=acc1.ReadLattice("lattice.txt");
+  char addresspout[99];
+  char addressmout[99];
+  acc1.PIC3D_ICEFROG();
+  cout<<setiosflags(ios::left);
+  ofstream single("singleparticle.dat");
+
+#pragma omp parallel num_threads(4) 
+  {
+    for(int i=0;i<maxStepNumber;i++)
+    {
+      if(current>1e-8)
+      {
+	acc1.PIC3D_SpaceCharge();
+      }
+      acc1.PIC3D_PUSH(timeNow);
+#pragma omp single
+      {
+	timeNow+=steptime;
+	cout<<i<<"/"<<maxStepNumber<<"   "<<acc1.particleInMeshNumber<<"/"<<acc1.particleLiveNumber<<"/"<<particlenumber<<"  "<<setw(5)<<acc1.tww().back().at(0)<<"/"<<elelength<<"  "<<acc1.xyz()[0][4]<<"  "<<acc1.tww().back().at(1)<<"MeV  "<<endl;
+	for(int d=0;d<6;++d)
+	{
+	  single<<setw(12)<<acc1.xyz()[0][d]<<"  ";
+	}
+	single<<endl;
+	if(1&&i%100==0)
+	{
+	  sprintf(addresspout,"data/PIC%06d.dat",i);
+	  ofstream pout(addresspout);
+	  if(pout)  
+	  {
+	    for(int j=0;j<particlenumber;++j)
+	    {
+	      if(!acc1.pLS()[j])
+	      {
+		for(int k=0;k<6;++k)
+		{
+		  if(k==4)
+		  {
+		    //pout<<acc1.xyz()[j][k]-acc1.tww().back().at(0)<<" \t";
+		    pout<<acc1.xyz()[j][k]<<" \t";
+		  }else if(k==5)
+		  {
+		    double beta =acc1.xyz()[j][k] / C_light;
+                    double gamma= 1/sqrt(1-beta*beta);
+		    double temp=(gamma-1)*MSta/acc1.tww().back().at(2)-1;
+		    //pout<<temp<<endl;
+		    pout<<acc1.xyz()[j][k]<<endl;
+		    //if(abs(temp)>0.5) cout<<j<<"  "<<i<<"  "<<temp<<endl;
+		  }else
+		  {
+		    pout<<acc1.xyz()[j][k]<<" \t";
+		  }
+		}
+	      }
+	    }
+	  }
+	  pout.close();
+	  /*
+	  sprintf(addressmout,"data/PICmf%06d.dat",i);
+	  pout.open(addressmout);
+	  if(pout)  printvector(pout,acc1.mf());
+	  pout.close();
+	  */
+	}
+      }
+      if(acc1.tww().back()[0]>elelength  ||  acc1.particleLiveNumber==0) 
+      {
+          sprintf(addresspout,"data/outputParticle.dat");
+	  ofstream pout(addresspout);
+	  if(pout)  
+	  {
+	    for(int j=0;j<particlenumber;++j)
+	    {
+	      if(!acc1.pLS()[j])
+	      {
+		for(int k=0;k<6;++k)
+		{
+		  if(k==4)
+		  {
+		    pout<<acc1.xyz()[j][k]-acc1.tww().back().at(0)<<" \t";
+		    //pout<<acc1.xyz()[j][k]<<" \t";
+		  }else if(k==5)
+		  {
+		    double beta =acc1.xyz()[j][k] / C_light;
+                    double gamma= 1/sqrt(1-beta*beta);
+		    double temp=(gamma-1)*MSta/acc1.tww().back().at(2)-1;
+		    //pout<<temp<<endl;
+		    pout<<acc1.xyz()[j][k]<<endl;
+		    //if(abs(temp)>0.5) cout<<j<<"  "<<i<<"  "<<temp<<endl;
+		  }else
+		  {
+		    pout<<acc1.xyz()[j][k]<<" \t";
+		  }
+		}
+	      }
+	    }
+	  }
+	  pout.close();
+	break;
+      }
+    }
+  }
+  acc1.PIC3D_FIREFROG();
+  //acc1.CalMatchR();
+  string addout="x2_"+to_string(maxStepNumber)+".dat";
+  ofstream twwout(addout);
+  printvector(twwout,acc1.tww());
+  
+  string addout2="beam.cellend";
+  ofstream twout(addout2);
+  ifstream rf("ADS_RFQ");
+  vector<double> cell_position;
+  vector<double> cell_length;
+  vector<double> cell_position_end;
+  string str;
+  vector<string> strVec;
+  
+  for(int i = 0;rf.peek()!=EOF;++i)
+  {
+    getline(rf,str);
+    StringSplit(str,strVec);
+    if(i==0)
+      cell_position.push_back(0.0);
+    else
+      cell_position.push_back(cell_position.back()+cell_length.back());
+    cell_length.push_back(stod(	strVec[1])/100);
+    cell_position_end.push_back(cell_length.back()+cell_position.back());
+  }
+  
+  int size= acc1.tww().size();
+  int j =0;
+  for(int i=0; i<size; ++i)
+  {
+    if(acc1.tww()[i][0]>cell_position[j])
+    {
+      for( int k=0;k<acc1.tww()[i].size();++k)
+      {
+	twout<<setw(10)<<acc1.tww()[i][k]<<"  ";
+      }
+      twout<<endl;
+      if(j==cell_position.size()-1)  break;
+      if(j< cell_position.size()-1)  j++;
+    }
+  }
+
+
+  //
+  /*
+     ofstream xyout("acc1.xyz().dat");
+     for(int i=0;i<particlenumber;i++)
+     {
+     xyout<<setw(10)<<acc1.xyz()[i][0]<<"   "<<setw(10)<<acc1.xyz()[i][1]<<"   "<<setw(10)<<acc1.xyz()[i][2]<<"   "<<setw(10)<<acc1.xyz()[i][3]<<endl;
+     }
+     gout.close();
+     */
+
+if(0)
+{
+  //benchmark rho
+  vector<vector<vector<double>  > >  rho_test(numofgridx,   vector<vector<double> >(numofgridy,  vector<double>(numofgridz)));
+  ofstream ggout("rhobench.dat");
+  double sumrho=0;
+  for(int j=1;j<numofgridy-1;j++)
+  {
+    for(int i=1;i<numofgridy-1;i++)
+    {
+      for(int k=1;k<numofgridz-1;k++)
+      {
+	rho_test[i][j][k]=-(
+	    (acc1.phi()[i-1][j][k]-2*acc1.phi()[i][j][k]+acc1.phi()[i+1][j][k])/1
+	   +(acc1.phi()[i][j-1][k]-2*acc1.phi()[i][j][k]+acc1.phi()[i][j+1][k])/1
+	   +(acc1.phi()[i][j][k-1]-2*acc1.phi()[i][j][k]+acc1.phi()[i][j][k+1])/1
+	    )*epsilon;
+	ggout<<i<<"  "<<j<<"  "<<k<<"  "<<setw(10)<<rho_test[i][j][k]<<"   "<<endl;
+	sumrho+=rho_test[i][j][k];
+      }
+      ggout<<endl;
+    }
+    ggout<<endl;
+  }
+  cout<<"sum rho bench=  "<<sumrho<<endl;
+  ggout.close();
+}
+  /*
+  //benchmark phi ana
+  vector<vector<double>  >   phibench(numofgridx,   vector<double>(numofgridy));
+  vector<vector<double>  >   exbench(numofgridx,   vector<double>(numofgridy));
+  vector<vector<double>  >   eybench(numofgridx,   vector<double>(numofgridy));
+  ofstream phibenchout("phibench.dat");
+  double x,y,x1,y1;
+  double centerlengthx=numofgridx/2-0.5;
+  double centerlengthy=numofgridy/2-0.5;
+  for(int j=0;j<numofgridy;j++)
+  {
+  for(int i=0;i<numofgridx;i++)
+  {
+  x=double(i)-numofgridx/2+0.5;
+  y=double(j)-numofgridy/2+0.5;
+
+  phibench[i][j]=0;
+  exbench[i][j]=0;
+  eybench[i][j]=0;
+  for(int m=-1;m<2;m++)
+  for(int n=-1;n<2;n++)
+  {
+  x1=x+m*(numofgridx+2);
+  y1=y+n*(numofgridy+2);
+  x1=x1*0.001;
+  y1=y1*0.001;
+  if((abs(m)+abs(n))%2==0)
+  {
+  phibench[i][j]+=-0.5/M_PI/epsilon*10000*macrocharge*log(sqrt(x1*x1+y1*y1));
+  exbench[i][j]+=0.5/M_PI/epsilon*10000*macrocharge/(x1*x1+y1*y1)*x1;
+  eybench[i][j]+=0.5/M_PI/epsilon*10000*macrocharge/(x1*x1+y1*y1)*y1;
+  //cout<<x1*x1+y1*y1<<"   "<<log(sqrt(x1*x1+y1*y1))<<"   "<<phibench[i][j]<<endl;
+  }
+  else
+  {
+  phibench[i][j]-=-0.5/M_PI/epsilon*10000*macrocharge*log(sqrt(x1*x1+y1*y1));
+  exbench[i][j]+=0.5/M_PI/epsilon*10000*macrocharge/(x1*x1+y1*y1)*x1;
+  eybench[i][j]+=0.5/M_PI/epsilon*10000*macrocharge/(x1*x1+y1*y1)*y1;
+  }
+  }
+  phibenchout<<setw(10)<<(phibench[i][j])<<"   ";
+  }
+  phibenchout<<endl;
+  }
+  phibenchout.close();
+
+  //benchmark phi
+  ofstream gout("phi.dat");
+  for(int j=0;j<numofgridy;j++)
+  {
+  for(int i=0;i<numofgridx;i++)
+  {
+  gout<<setw(10)<<acc1.phi()[i][j]<<"   ";
+  }
+  gout<<endl;
+}
+gout.close();
+
+ofstream conout("contrast.dat");
+for(int j=numofgridy/3;j<2*numofgridy/3;j++)
+{
+  for(int i=numofgridx/3;i<2*numofgridx/3;i++)
+  {
+    conout<<setw(10)<<acc1.ex()[i][j]-exbench[i][j]<<"   ";
+  }
+  conout<<endl;
+}
+conout.close();
+*/
+t2=time(NULL);
+cout<<"time spend : "<<(t2-t1)<<" s"<<endl;
+cout<<"COMPLETE!"<<endl;
+}

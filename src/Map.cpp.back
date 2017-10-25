@@ -1,0 +1,1925 @@
+#include "Map.h"
+using namespace std;
+using namespace Eigen;
+Mapmain::~Mapmain()
+{
+}
+Mapmain::Mapmain()
+{
+  R1=MatrixXd::Identity(6,6);
+  R2=MatrixXd::Zero(3,3);
+  MPI_Comm_rank(MPI_COMM_WORLD,&myid);
+  MPI_Comm_size(MPI_COMM_WORLD,&numprocs);
+  MPI_Get_processor_name(processor_name,&namelen);
+}
+
+void Mapmain::latticeinput(char *p,int numberdivided)
+{
+  double Ek=0.35;	//MeV
+  double MSta=938.272;
+  EGammaIni=1+Ek/MSta;
+  cout<<"EGammaIni  :"<<EGammaIni<<endl; 
+  EBetaIni=sqrt(1.0-1.0/EGammaIni/EGammaIni);
+  lattice1.read(p,EGammaIni,numberdivided,3);
+  Mcount=lattice1.Mat.size();
+  NDivide=numberdivided;
+  if(myid==0)
+  {
+    ofstream matrix("matrix.dat");
+    MatrixXd t= MatrixXd::Identity(6,6);
+    for(i=0;i<lattice1.Mat.size();i++)
+    {
+      t=lattice1.Mat[i]*t;
+      matrix<<i<<"\t"<<lattice1.ELE[i].name<<"\n"<<lattice1.Mat[i]<<endl;
+    }
+    matrix.close();
+  }
+}
+
+void Mapmain::caculate()
+{
+  R1=MatrixXd::Identity(6,6);
+  for(k=0;k<lattice1.Mat.size();k++)
+  {
+    R1=lattice1.Mat[k]*R1;
+  }
+  if(1||ParamFlag)
+    cout<<"transfer matrix is\n"<<R1<<endl;
+  twisscaculate();
+}
+//twiss caculate
+void Mapmain::twisscaculate()
+{
+  ParamFlag=1;
+  double temp;
+  temp=acos((R1(0,0)+R1(1,1))/2);
+  beam.settwissx((R1(0,0)-R1(1,1))/2/sin(temp),abs(R1(0,1)/sin(temp)));
+  if(ParamFlag)
+  {
+    cout<<"twixx_x\n";
+    cout<<getbetax()<<" "<<beam.getTAlphax()<<" "<<beam.getTGammax()<<endl;
+  }
+  temp=acos((R1(2,2)+R1(3,3))/2);
+  beam.settwissy((R1(2,2)-R1(3,3))/2/sin(temp),abs(R1(2,3)/sin(temp)));
+  if(ParamFlag)
+  {
+    cout<<"twixx_y\n";
+    cout<<getbetay()<<" "<<beam.getTAlphay()<<" "<<beam.getTGammay()<<endl;
+  }
+}
+
+//====================================
+//Twiss scan
+
+void Mapmain::twissscan(int period,double initialbetax,double initialalphax,double initialbetay,double initialalphay)
+{
+  char *p="twissscanp.dat";
+  double step=4;
+  int directionflag=0,directionflagtemp=0;
+  int steplimit=20;
+  int MCounttemp=Mcount;
+  double finalbetax=0;
+  Mcount=period*NDivide;
+  double tempbetax=initialbetax;
+  for(int itwscan=0;itwscan<steplimit && abs(finalbetax-tempbetax)>1e-3;itwscan++)
+  {
+    if(myid==0)
+    {
+      double a[]={initialbetax,initialalphax,initialbetay,initialalphay,0};
+      vector<double> v1(a,a+7);
+      KVdistributionT(v1,10000,p);
+      preparticle(p);
+    }
+    MPI_Barrier(MPI_COMM_WORLD);
+    particleread(p);
+    tempbetax=beam.getsigmax()*4/100;
+    ptrackall(1,p);
+    if(myid==0)
+    {
+      finalbetax=beam.getsigmax()*4/100;
+      directionflagtemp=directionflag;
+      if(finalbetax>tempbetax)
+      {
+	initialbetax=initialbetax+step;
+	directionflag=1;
+      }
+      else if(finalbetax<tempbetax)
+      {
+	initialbetax=initialbetax-step;
+	directionflag=0;
+      }
+      if(directionflagtemp!=directionflag)
+      {
+	step=step/2;
+      }
+    }
+    MPI_Barrier(MPI_COMM_WORLD);
+    MPI_Bcast(&initialbetax,1,MPI_DOUBLE,0,MPI_COMM_WORLD);
+    MPI_Barrier(MPI_COMM_WORLD);
+    MPI_Bcast(&finalbetax,1,MPI_DOUBLE,0,MPI_COMM_WORLD);
+    MPI_Barrier(MPI_COMM_WORLD);
+    if(myid==0)
+      cout<<" betax  value  is  "<<initialbetax<<endl;
+  }
+  Mcount=MCounttemp;
+  if(myid==0)
+  {
+    cout<<"!perioded  betax  value  is  "<<initialbetax<<endl;
+    MPI_Barrier(MPI_COMM_WORLD);
+    unlink(p);
+  }
+}
+
+
+void Mapmain::Gtwissscan(int period,double betax1,double betax2,double alphax1,double alphax2,double betay1,double betay2,double alphay1,double alphay2)
+{
+  limit1[0]=0;
+  limit1[1]=-1000;
+  limit1[2]=0;
+  limit1[3]=-500;
+  limit2[0]=2000;
+  limit2[1]=1000;
+  limit2[2]=1500;
+  limit2[3]=500;
+  int genum=30;
+  int genummax=100;
+  simpnum=3000;
+  int GenerationNum=100;
+
+  double fitall=0,fittemp=0,fitaverage=0;
+  vector<vector<double>  >   twiss(200,   vector<double>(5));
+  twiss.reserve(200);
+  if(myid==0)
+    twiss.resize(genum);
+  vector<vector<double>  >  goodtwiss(0,  vector<double>(5));
+  int goodnum; 
+
+  double temp;
+  double twiss1[4]={betax1,alphax1,betay1,alphay1};
+  double twiss2[4]={betax2,alphax2,betay2,alphay2};
+  double step[4];
+  //  double twisstemp[4],twissfinal[4];
+  vector<double> tempv; 
+
+  for(i=0;i<4;i++)
+  {
+    if(twiss1[i]>twiss2[i])
+    {
+      temp=twiss1[i];
+      twiss1[i]=twiss2[i];
+      twiss2[i]=temp;
+    }
+    step[i]=twiss2[i]-twiss1[i];
+    // cout<<i<<"   "<<twiss2[i]<<"  "<<twiss1[i]<<endl;
+  }
+
+
+  double MutationRate=0.5;
+  double MutationPerturbation[4];
+  for(i=0;i<4;i++)
+  {
+    MutationPerturbation[i]=step[i]/5;
+  }
+
+  for(int gec=0;gec<genum;gec++)
+    for(i=0;i<4;i++)
+      twiss[gec][i]=twiss1[i]+(double)rand()/RAND_MAX*(twiss2[i]-twiss1[i]);
+
+  /*
+     for(int gec=0;gec<20;gec++)
+     {
+     twiss[gec][0]=10.931334;
+     twiss[gec][1]=1e-5;
+     twiss[gec][2]=1.2421721;
+     twiss[gec][3]=1e-5 ;
+     }
+     */
+
+  char *p="twissscangenep.dat";
+  int MCounttemp=Mcount;
+  Mcount=period*NDivide;
+  ParamFlag=0;
+
+  for(int gec=0;gec<genum;gec++)
+  {
+    Gfitness(twiss[gec]);
+  }
+
+  //sort(twiss.begin(),twiss.end(),GSortbyfitness);
+  if(myid==0)
+  {
+    for(i=0;i<genum-1;i++) 
+      for (j =0;j< genum - 1 - i; j++) 
+	if (twiss[j][4] < twiss[j + 1][4]) 
+	  twiss[j].swap(twiss[j+1]);
+  }
+  //generation by generation
+  ofstream gtout("gtout.dat");
+  MPI_Barrier(MPI_COMM_WORLD);
+  for(int generation=0;generation<GenerationNum;generation++)
+  {
+    //selection function
+    goodnum=genum/2+1;
+    if(myid==0)
+    {
+
+      double Slice;
+      double fitnesssofar;
+
+      goodtwiss.clear();
+      fitall=0;
+      for(j=0;j<genum;j++)
+      {
+	fitall+=twiss[j][4];
+      }
+      fitaverage=fitall/genum;
+      for(j=0;j<goodnum;j++)
+      {
+	Slice = (double)rand()/RAND_MAX*fitall;
+	fitnesssofar=0;
+	for(i=0;i<genum;i++)
+	{
+	  fitnesssofar+=twiss[i][4];
+	  if(fitnesssofar>=Slice)
+	  {
+	    goodtwiss.push_back(twiss[i]);
+	    /*cout<<j<<"  Slice  "<<i<<"   ";
+	      for(int ii=0;ii<5;ii++)
+	      {
+	      cout<<setw(6)<<goodtwiss[j][ii]<<"  ";
+	      }
+	      cout<<endl;*/
+	    break;
+	  }
+	}
+      }
+    }
+
+    //recombonation
+    if(myid==0)
+      cout<<setw(20)<<"RECOMBINATION NUM  "<<goodnum<<"  "<<endl;
+    int recombnum=genum/7,a1,a2;
+    double blancenum;
+    vector<double> tempr1,tempr2,tempr3,tempr4;
+
+    for(int recn=0;recn<recombnum;recn++)
+    {
+      if(myid==0)
+      {
+	a1=(double)rand() / RAND_MAX * goodnum;
+	tempr1=goodtwiss[a1];
+	goodtwiss.erase(goodtwiss.begin()+a1);
+	goodnum--;
+	//tempr1.clear();
+	/*        for(int ii=0;ii<5;ii++)
+		  {
+		  tempr1.push_back(goodtwiss[a1][ii]);
+		  cout<<setw(6)<<tempr1[ii]<<"  ";
+		  }
+		  cout<<endl;*/
+
+	a2=(double)rand() / RAND_MAX * goodnum;
+	tempr2=goodtwiss[a2];
+	goodtwiss.erase(goodtwiss.begin()+a2);
+	goodnum--;
+	/*        for(int ii=0;ii<5;ii++)
+		  {
+		  cout<<tempr2[ii]<<"  ";
+		  }
+		  cout<<endl;*/
+
+	tempr3.clear();
+	tempr4.clear();
+	for(j=0;j<4;j++)
+	{
+	  blancenum=(double)rand() / RAND_MAX;
+	  tempr3.push_back(tempr1[j]+ blancenum*(tempr2[j]-tempr1[j]));
+	  tempr4.push_back(tempr1[j]+(1- blancenum)*(tempr2[j]-tempr1[j]));
+	  //       cout<<tempr3[j]<<endl;
+
+	}
+	tempr3.push_back(0);
+	tempr4.push_back(0);
+      }
+      Gfitness(tempr3);
+      Gfitness(tempr4);
+      if(myid==0)
+      {
+	twiss.push_back(tempr3);
+	twiss.push_back(tempr4);
+      }
+      genum=genum+2;
+    }
+
+    //mutation
+
+    MPI_Bcast(&genum,1,MPI_INT,0,MPI_COMM_WORLD);
+    MPI_Barrier(MPI_COMM_WORLD);
+    int MutationFlag=0;
+    if(MutationRate>0.1)
+      MutationRate-=0.005;
+    if(myid==0)
+      cout<<setw(20)<<"MUTATION RATE  "<<MutationRate<<endl;
+    for(int jcount=0;jcount<genum;jcount++)
+    {
+      if(myid==0)
+      {
+	for(i=0;i<4;i++)
+	{
+	  MutationPerturbation[i]=step[i]/(generation/5+3);
+	}
+	MutationFlag=0;
+	for(i=0;i<4;i++)
+	{
+	  if((double)rand()/RAND_MAX < MutationRate)
+	  {
+	    MutationFlag=1;
+	    twiss[jcount][i]+=gaussrand()*MutationPerturbation[i];
+	    if(twiss[jcount][i]<twiss1[i])
+	      twiss[jcount][i]=twiss1[i];
+	    if(twiss[jcount][i]>twiss2[i])
+	      twiss[jcount][i]=twiss2[i];
+	    //if(twiss[jcount][i]==0)
+	    //twiss[jcount][i]=1e-5;
+	  }
+	}
+      }
+      MPI_Bcast(&MutationFlag,1,MPI_INT,0,MPI_COMM_WORLD);
+      MPI_Barrier(MPI_COMM_WORLD);
+      if(MutationFlag)
+      {
+	Gfitness(twiss[jcount]);
+	//  if(myid==0)
+	//  cout<<jcount<<"  "<<twiss.size()<<endl;
+      }
+    }
+
+    if(myid==0)
+    {
+      //sort
+      for(i=0;i<genum-1;i++) 
+	for (j =0;j< genum - 1 - i; j++) 
+	  if (twiss[j][4] < twiss[j + 1][4]) 
+	    twiss[j].swap(twiss[j+1]);
+
+
+      //kill function
+
+
+
+      if((double)rand()/RAND_MAX<0.1*genum/genummax)
+      {
+	for(i=0;genum>genummax;i++)
+	{
+	  /*          cout<<"pop_back  ";
+		      for(int ii=0;ii<5;ii++)
+		      {
+		      cout<<setw(6)<<twiss.back()[ii]<<"  ";
+		      }
+		      cout<<endl;
+		      */
+	  twiss.pop_back();
+	  genum--;
+	}
+      }
+      double to1=0;
+      cout<<endl;
+      for(i=0;i<genum&&i<20;i++)
+      {
+	for(j=0;j<5;j++)
+	{
+	  cout<<setw(10)<<twiss[i][j]<<" ";
+	}
+	to1+=twiss[i][0];
+	cout<<"  "<<i<<endl;
+      }
+      cout<<endl;
+      gtout<<generation<<"   "<<to1/20<<"   "<<twiss[0][0]<<endl;
+      cout<<"genum = "<<genum<<" , generation = "<<generation<<" , average = "<<fitaverage<<endl;
+      cout<<"best fit   ";
+      for(int ii=0;ii<5;ii++)
+      {
+	cout<<setw(10)<<twiss[0][ii]<<" ";
+      }
+      cout<<endl<<endl;;
+    }
+    MPI_Bcast(&genum,1,MPI_INT,0,MPI_COMM_WORLD);
+    MPI_Barrier(MPI_COMM_WORLD);
+
+
+  }
+  //the end of evolution
+
+  Mcount=MCounttemp;
+  ParamFlag=1;
+
+  if(myid==0)
+  {
+    cout<<"!perioded  value  is  "<<endl;
+    for(i=0; i<twiss[0].size(); i++)
+    {
+      cout<<twiss[0][i]<<endl;
+    }
+    unlink(p);
+  }
+
+  MPI_Barrier(MPI_COMM_WORLD);
+}
+
+void Mapmain::Gfitness2(vector<double> &v1)
+{        
+  double twisstemp[4],twissfinal[4];
+  double fittemp=0,fitness;
+  char *p="twissscangenep.dat";
+  if(myid==0)//
+  {
+    KVdistributionT(v1,simpnum,p);
+    preparticle(p);
+  }
+  MPI_Barrier(MPI_COMM_WORLD);
+  if(myid==0)
+  {
+    particleread(p);
+    twisstemp[0]=sqrt(beam.getsigmax())*2;
+    twisstemp[1]=sqrt(beam.getemittancex()/beam.getsigmax())*2;
+    twisstemp[2]=sqrt(beam.getsigmay())*2;
+    twisstemp[3]=sqrt(beam.getemittancey()/beam.getsigmay())*2;
+  }
+
+  ptrackall(1,p);
+
+  if(myid==0)
+  {
+    twissfinal[0]=sqrt(beam.getsigmax())*2;
+    twissfinal[1]=sqrt(beam.getemittancex()/beam.getsigmax())*2;
+    twissfinal[2]=sqrt(beam.getsigmay())*2;
+    twissfinal[3]=sqrt(beam.getemittancey()/beam.getsigmay())*2;
+  }
+  if(myid==0)
+  {
+    for(int ii=0;ii<4;ii=ii+2)
+    {
+      fittemp+=abs(twissfinal[ii]-twisstemp[ii])/twisstemp[ii];
+    }
+    fitness=(1/fittemp);
+    //cout<<rand()<<endl;
+    for(int jj=0;jj<Mcount;jj++)
+    {
+      for(int ii=0;ii<4;ii++)
+      {
+	if(Param[jj][ii]<limit1[ii]||Param[jj][ii]>limit2[ii])
+	{
+	  fitness=fitness*0.8;
+	  //cout<<"aooo~~"<<Param[jj][ii]<<"   "<<limit2[ii]<<endl;
+	}
+      }
+    }
+    MPI_Barrier(MPI_COMM_WORLD);
+    MPI_Bcast(&fitness,1,MPI_DOUBLE,0,MPI_COMM_WORLD);
+    v1.back()=fitness;
+    /*
+       for(int ii=0;ii<5;ii++)
+       {
+       cout<<setw(6)<<v1[ii]<<"  ";
+       }
+       cout<<endl;
+       */
+  }
+}
+
+void Mapmain::Gfitness(vector<double> &v1)
+{
+  double twisstemp[4],twissfinal[4];
+  double fittemp=0,fitness;
+  if(myid==0)
+  {
+    twisstemp[0]=v1[1];
+    twisstemp[1]=v1[2];
+    twisstemp[2]=v1[4];
+    twisstemp[3]=v1[5];
+
+    twisstrack(v1[1],v1[2],'x');
+    twissfinal[0]=twiss(0);
+    twissfinal[1]=twiss(1);
+    twisstrack(v1[4],v1[5],'y');
+    twissfinal[2]=twiss(0);
+    twissfinal[3]=twiss(1);
+    for(int ii=0;ii<4;ii=ii+2)
+    {
+      fittemp+=abs((twissfinal[ii]-twisstemp[ii])/twisstemp[ii]);
+    }
+    for(int ii=1;ii<4;ii=ii+2)
+    {
+      fittemp+=abs((twissfinal[ii]-twisstemp[ii]));
+    }
+
+    fitness=(1/fittemp);
+    v1.back()=fitness;
+
+    /*
+       for(int ii=0;ii<5;ii++)
+       {
+       cout<<setw(6)<<v1[ii]<<"  ";
+       }
+       cout<<endl;
+       */
+  }
+}
+
+void Mapmain::Gselection()
+{}
+void Mapmain::Gmutate(vector<double> &chromo)
+{
+}
+bool Mapmain::GSortbyfitness(const vector<double> &v1,const vector<double> &v2)
+{
+  return v1[v1.size()-1]<v2[v2.size()-1];
+}
+//啊啊啊啊啊啊
+int Mapmain::Glatticescan(LatticeMap e1,LatticeMap e2,const vector<double> &v1,const double &PX,const double &PY)
+{
+  double v22[]={10.931333,0.0,1.242172,0.0};
+  vector<double> v2(v22,v22+5);
+  PhaseExpect_X=PX;
+  PhaseExpect_Y=PY;
+  return Glatticescan(e1,e2,v1,v2,3);
+}
+
+int Mapmain::Glatticescan(LatticeMap e1,LatticeMap e2,const double &PX,const double &PY)
+{
+  double v11[]={10.931333,0.0,1.242172,0.0};
+  vector<double> v1(v11,v11+5);
+  double v22[]={10.931333,0.0,1.242172,0.0};
+  vector<double> v2(v22,v22+5);
+  PhaseExpect_X=PX;
+  PhaseExpect_Y=PY;
+  return Glatticescan(e1,e2,v1,v2,4);
+}
+
+int Mapmain::Glatticescan(LatticeMap e1,LatticeMap e2,const vector<double> &v1,const vector<double> &v2,int FIT)
+{
+  int size;
+
+  if(e1.ELE.size()!=e2.ELE.size())
+    return 1;
+  else
+    size=e1.ELE.size();
+
+  if(FIT>=1&&FIT<=4)
+    FitType=FIT;
+  else
+  {
+    cout<<"FitType Error!"<<endl;
+    return 2;
+  }
+
+  ParamFlag=0;
+  twiss_In=v1;
+  twiss_Out=v2;
+  emitGLx=100;
+  emitGLy=100;
+
+  //Parameter to be changed Autodetector
+  //LIMIT: Only allow one parameter to be change in every Element
+  vector<int> loc;
+  vector<int> lod;
+  for(int lzc=0;lzc<size;lzc++)
+  {
+    if(e1.ELE[lzc]!=e2.ELE[lzc])
+    {
+
+      for(int lz=0;lz<e1.ELE[lzc].p.size();lz++)
+      {
+	if(e1.ELE[lzc].p[lz]!=e2.ELE[lzc].p[lz])
+	{
+	  lod.push_back(lz);
+	  loc.push_back(lzc);
+	}
+      }
+      //cout<<loc.back()<<"  "<<lod.back()<<endl;
+    }
+  }
+
+  vector<int>		link;
+  link.resize(size);
+  for(int ii=0;ii<link.size();ii++)
+  {
+    link[ii]=-1;
+  }
+  link[7]=0;
+  link[4]=3;
+
+  limit1[0]=0;
+  limit1[1]=-1000;
+  limit1[2]=0;
+  limit1[3]=-500;
+  limit2[0]=2000;
+  limit2[1]=1000;
+  limit2[2]=1500;
+  limit2[3]=500;
+
+  simpnum		=	10000;
+  int 	genum		=	30;
+  int 	genummax	=	100;
+  int 	GenerationNum	=	100;
+
+  double fitall=0,fittemp=0,fitaverage=0;
+  vector<LatticeMap>	Latt;
+  Latt.resize(genum);
+  vector<LatticeMap>	GoodLatt;
+  int goodnum; 
+
+  Element tempEle;
+  vector<double> step(loc.size());
+  vector<double> tempv; 
+
+  for(int ii=0;ii<loc.size();ii++)
+  {
+    if(e1.ELE[loc[ii]].p[lod[ii]]>e2.ELE[loc[ii]].p[lod[ii]])
+    {
+      tempEle=e1.ELE[loc[ii]];
+      e1.modify(loc[ii],(e2.ELE[loc[ii]]));
+      e2.modify(loc[ii],tempEle);
+      if(myid==0)
+	cout<<e1.ELE[loc[ii]].p[lod[ii]]<<endl;
+    }
+    step[ii]=e2.ELE[loc[ii]].p[lod[ii]]-e1.ELE[loc[ii]].p[lod[ii]];
+    if(myid==0)
+      cout<<loc[ii]<<"   "<<e1.ELE[loc[ii]].p[lod[ii]]<<"  "<<e2.ELE[loc[ii]].p[lod[ii]]<<endl;
+  }
+
+
+  double MutationRate=0.5;
+  vector<double>	MutationPerturbation(loc.size());
+  for(i=0;i<loc.size();i++)
+  {
+    MutationPerturbation[i]=step[i]/5;
+  }
+  for(int gec=0;gec<genum;gec++)
+  {
+    Latt[gec]=e1;
+    for(i=0;i<loc.size();i++)
+    {
+      double t=(double)rand()/RAND_MAX;
+      MPI_Bcast(&t,1,MPI_DOUBLE,0,MPI_COMM_WORLD);
+      MPI_Barrier(MPI_COMM_WORLD);
+      tempEle=e1.ELE[loc[i]];
+      tempEle.p[lod[i]]+=t*step[i];
+      Latt[gec].modify(loc[i],tempEle);
+      for(int ii=0;ii<link.size();ii++)
+      {
+	if(link[ii]!=-1)
+	{
+	  Latt[gec].modify(ii,Latt[gec].ELE[link[ii]]);
+	}
+      }
+    }
+  }
+  /*
+     LatticeMap Lt;
+     Lt.read("lattice3.txt",1.3);
+     for(int gec=0;gec<10;gec++)
+     {
+     Latt[gec]=Lt;
+     }
+     */
+  char *p="Latticescangenep.dat";
+  double FitnessExpect=1e99;
+  if(myid==0&&FitType==1)
+  {
+    KVdistributionT(twiss_In,simpnum,p);
+    //distribution(v1[0]*v1[1],v1[0],v1[2]*v1[3],v1[2],0,0,0,0,0,0,simpnum,p);
+    preparticle(p);
+    double twisstemp[4];
+    if(myid==0)
+    {
+      particleread(p);
+    }
+    twisstemp[0]=beam.getsigmax()*4/emitGLx;
+    twisstemp[1]=-1*twisstemp[0]*beam.getsigmaxdx()/beam.getsigmax();
+    twisstemp[2]=beam.getsigmay()*4/emitGLy;
+    twisstemp[3]=-1*twisstemp[2]*beam.getsigmaydy()/beam.getsigmay();
+
+    fittemp+=abs(twisstemp[0]-twiss_In[1])/twiss_In[1];
+    fittemp+=abs(twisstemp[1]-twiss_In[2]);
+    fittemp+=abs(twisstemp[2]-twiss_In[4])/twiss_In[4];
+    fittemp+=abs(twisstemp[3]-twiss_In[5]);
+
+    FitnessExpect=(1/fittemp);
+  }
+  LatticeMap lattemp=lattice1;
+  MPI_Bcast(&FitnessExpect,1,MPI_DOUBLE,0,MPI_COMM_WORLD);
+  MPI_Barrier(MPI_COMM_WORLD);
+
+  for(int gec=0;gec<genum;gec++)
+  {
+    GLfitness(Latt[gec]);
+    if(myid==0)
+      cout<<Latt[gec].fitness<<"  "<<gec<<endl;
+  }
+
+  for(i=0;i<genum-1;i++) 
+    for (j =0;j< genum - 1 - i; j++) 
+      if (Latt[j].fitness < Latt[j + 1].fitness)
+      {
+	LatticeMap L=Latt[j];
+	Latt[j]=Latt[j+1];
+	Latt[j+1]=L;
+      }
+  int recombnum;
+  ofstream gout("glout.dat");
+  //generation by generation
+  MPI_Barrier(MPI_COMM_WORLD);
+  for(int generation=0;  generation<GenerationNum && Latt[20].fitness<FitnessExpect;  generation++)
+  {
+    //selection function
+    goodnum=genum/2+1;
+    double Slice;
+    double fitnesssofar;
+
+    GoodLatt.clear();
+    fitall=0;
+    for(j=0;j<genum;j++)
+    {
+      fitall+=Latt[j].fitness;
+    }
+    //cout<<fitall<<"   "<<myid<<endl;
+    fitaverage=fitall/genum;
+    for(j=0;j<goodnum;j++)
+    {
+      Slice = (double)rand()/RAND_MAX*fitall;
+      MPI_Bcast(&Slice,1,MPI_DOUBLE,0,MPI_COMM_WORLD);
+      MPI_Barrier(MPI_COMM_WORLD);
+      fitnesssofar=0;
+      for(i=0;i<genum;i++)
+      {
+	fitnesssofar+=Latt[i].fitness;
+	//cout<<"fitnesssofar and Slice"<<fitnesssofar<<"  "<<Slice<<"  "<<i<<endl;
+	if(fitnesssofar>=Slice)
+	{
+	  GoodLatt.push_back(Latt[i]);
+	  /*
+	     if(myid==0)
+	     {
+	     cout<<j<<"  Slice  "<<i<<"  "<<GoodLatt.back().fitness<<endl;
+	     MPI_Barrier(MPI_COMM_WORLD);
+	     }
+	     */
+	  break;
+	}
+      }
+    }
+    DEBUG=0;
+    //recombonation
+    recombnum=genum/7;
+    int a1,a2;
+    if(myid==0)
+      cout<<setw(20)<<"LATTICE RECOMBINATION  "<<recombnum<<"  "<<endl;
+    double blancenum;
+    LatticeMap tempr1,tempr2,tempr3,tempr4;
+
+    for(int recn=0;recn<recombnum;recn++)
+    {
+      a1=(double)rand() / RAND_MAX * goodnum;
+      MPI_Bcast(&a1,1,MPI_INT,0,MPI_COMM_WORLD);
+      MPI_Barrier(MPI_COMM_WORLD);
+      tempr1=GoodLatt[a1];
+      /*
+	 for(int co=0;co<tempr1.EGamma.size();co++)
+	 {
+	 if(co==0)
+	 cout<<tempr1.ELE[co].p[4]<<"   "<<a1<<"  "<<myid<<endl;
+	 MPI_Barrier(MPI_COMM_WORLD);
+	 }
+	 */
+
+      GoodLatt.erase(GoodLatt.begin()+a1);
+      goodnum--;
+
+      a2=(double)rand() / RAND_MAX * goodnum;
+      MPI_Bcast(&a2,1,MPI_INT,0,MPI_COMM_WORLD);
+      MPI_Barrier(MPI_COMM_WORLD);
+      tempr2=GoodLatt[a2];
+      GoodLatt.erase(GoodLatt.begin()+a2);
+      goodnum--;
+
+      tempr3=tempr1;
+      tempr4=tempr1;
+
+      for(j=0;j<loc.size();j++)
+      {
+	blancenum=(double)rand() / RAND_MAX;
+	MPI_Bcast(&blancenum,1,MPI_DOUBLE,0,MPI_COMM_WORLD);
+	MPI_Barrier(MPI_COMM_WORLD);
+	tempEle=tempr1.ELE[loc[j]];
+	tempEle.p[lod[j]]+=blancenum*(tempr2.ELE[loc[j]].p[lod[j]]-tempr1.ELE[loc[j]].p[lod[j]]);
+	tempr3.modify(loc[j],tempEle);
+
+	tempEle.p[lod[j]]+=(1 - 1*blancenum)*(tempr2.ELE[loc[j]].p[lod[j]]-tempr1.ELE[loc[j]].p[lod[j]]);
+	tempr4.modify(loc[j],tempEle);
+      }
+      for(int ii=0;ii<link.size();ii++)
+      {
+	if(link[ii]!=-1)
+	{
+	  tempr3.modify(ii,tempr3.ELE[link[ii]]);
+	  tempr4.modify(ii,tempr4.ELE[link[ii]]);
+	}
+      }
+
+
+      GLfitness(tempr3);
+      /*
+	 if(myid==0)
+	 {
+	 for(int i1=0;i1<loc.size();i1++)
+	 {
+	 cout<<tempr3.ELE[loc[i1]].p[lod[i1]]<<"  ";
+	 }
+	 cout<<tempr3.fitness<<endl;
+	 }
+	 */
+      GLfitness(tempr4);
+      Latt.push_back(tempr3);
+      Latt.push_back(tempr4);
+      genum=genum+2;
+    }
+    DEBUG=0;
+    //mutation
+    int MutationFlag=0;
+    if(MutationRate>0.1)
+      MutationRate-=0.005;
+    if(myid==0)
+      cout<<setw(20)<<"LATTICE MUTATION "<<MutationRate<<endl;
+    for(int jcount=0;jcount<genum;jcount++)
+    {
+      for(i=0;i<loc.size();i++)
+      {
+	MutationPerturbation[i]=step[i]/(generation/5+3);
+      }
+      MutationFlag=0;
+      for(i=0;i<loc.size();i++)
+      {
+	double mu1=(double)rand()/RAND_MAX;
+	MPI_Bcast(&mu1,1,MPI_DOUBLE,0,MPI_COMM_WORLD);
+	MPI_Barrier(MPI_COMM_WORLD);
+	if(mu1 < MutationRate)
+	{
+	  MutationFlag=1;
+	  double t19=gaussrand();
+	  MPI_Bcast(&t19,1,MPI_DOUBLE,0,MPI_COMM_WORLD);
+	  MPI_Barrier(MPI_COMM_WORLD);
+	  tempEle=Latt[jcount].ELE[loc[i]];
+	  tempEle.p[lod[i]]+=t19*MutationPerturbation[i];
+	  Latt[jcount].modify(loc[i],tempEle);
+	  if(Latt[jcount].ELE[loc[i]].p[lod[i]]<e1.ELE[loc[i]].p[lod[i]])
+	  {
+	    Latt[jcount].modify(loc[i],e1.ELE[loc[i]]);
+	  }
+	  if(Latt[jcount].ELE[loc[i]].p[lod[i]]>e2.ELE[loc[i]].p[lod[i]])
+	  {
+	    Latt[jcount].modify(loc[i],e2.ELE[loc[i]]);
+	  }
+	  for(int ii=0;ii<link.size();ii++)
+	  {
+	    if(link[ii]!=-1)
+	    {
+	      Latt[jcount].modify(ii,Latt[jcount].ELE[link[ii]]);
+	    }
+	  }
+	}
+      }
+      if(MutationFlag)
+      {
+	GLfitness(Latt[jcount]);
+      }
+    }
+
+    //sort
+    for(i=0;i<genum-1;i++)
+      for (j =0;j< genum - 1 - i; j++) 
+	if (Latt[j].fitness < Latt[j + 1].fitness)
+	{
+	  LatticeMap L=Latt[j];
+	  Latt[j]=Latt[j+1];
+	  Latt[j+1]=L;
+	}
+
+
+    //kill function
+    double mu1=(double)rand()/RAND_MAX;
+    MPI_Bcast(&mu1,1,MPI_DOUBLE,0,MPI_COMM_WORLD);
+    MPI_Barrier(MPI_COMM_WORLD);
+    if(mu1<0.1*genum/genummax)
+    {
+      for(i=0;genum>genummax;i++)
+      {
+	//          cout<<"pop_back  ";
+
+	Latt.pop_back();
+	genum--;
+      }
+    }
+    if(myid==0)
+    {
+      double to1=0,to2=0;
+      cout<<endl;
+      for(i=0;i<genum&&i<20;i++)
+      {
+	for(int i1=0;i1<loc.size();i1++)
+	{
+	  cout<<Latt[i].ELE[loc[i1]].p[lod[i1]]<<"  ";
+	  if(i1==0)
+	    to1+=Latt[i].ELE[loc[i1]].p[lod[i1]];
+	  if(i1==1)
+	    to2+=Latt[i].ELE[loc[i1]].p[lod[i1]];
+	}
+	cout<<Latt[i].fitness<<endl;
+      }
+      cout<<endl;
+      gout<<generation<<"   "<<to1/20<<"   "<<to2/20<<endl;
+      cout<<"genum = "<<genum<<" , generation = "<<generation<<" , average = "<<fitaverage<<endl;
+      cout<<"best fit =  "<<Latt[0].fitness;
+      if(FitnessExpect<1e10)
+	cout<<"  FitnessExpect=  "<<FitnessExpect;
+      cout<<endl;
+      /*
+	 cout<<"best fit   ";
+	 for(int ii=0;ii<5;ii++)
+	 {
+	 cout<<Latt[ii].fitness<<endl;;
+	 }*/
+      cout<<endl<<endl;;
+    }
+  }
+  //the end of evolution
+
+  lattice1=lattemp;
+  ParamFlag=1;
+  /*
+     if(myid==0)
+     {
+     cout<<"BEST LATTICE  "<<endl;
+     Latt[0].print();
+     unlink(p);
+     }
+     */
+  MPI_Barrier(MPI_COMM_WORLD);
+  return 0;
+}
+
+void Mapmain::GLfitness(LatticeMap &v)
+{
+  if(FitType==1)
+    GLfitness1(v);
+  else if(FitType==2)
+    GLfitness2(v);
+  else if(FitType==3)
+    GLfitness3(v);
+  else if(FitType==4)
+    GLfitness4(v);
+}
+
+void Mapmain::GLfitness1(LatticeMap &v)
+{
+  double twisstemp[4],twissfinal[4];
+  double fittemp=0,fitness;
+  char *p="Latticescangenep.dat";
+  if(myid==0)
+  {
+    particleread(p);
+  }
+  twisstemp[0]=beam.getsigmax()*4/emitGLx;
+  twisstemp[1]=-1*twisstemp[0]*beam.getsigmaxdx()/beam.getsigmax();
+  twisstemp[2]=beam.getsigmay()*4/emitGLy;
+  twisstemp[3]=-1*twisstemp[2]*beam.getsigmaydy()/beam.getsigmay();
+  /*
+     for(int i1=0;i1<4;i1++)
+     cout<<twisstemp[i1]<<"  ";
+     cout<<endl;
+     */
+  int tempM=Mcount;
+  lattice1=v;
+  Mcount=lattice1.ELE.size();
+
+  if(myid==0)
+  {
+    //lattice1.print();
+    //caculate();
+  }
+
+  MPI_Barrier(MPI_COMM_WORLD);
+
+  ptrackall(1,p);
+
+  twissfinal[0]=beam.getsigmax()*4/emitGLx;
+  twissfinal[1]=-1*twissfinal[0]*beam.getsigmaxdx()/beam.getsigmax();
+  twissfinal[2]=beam.getsigmay()*4/emitGLy;
+  twissfinal[3]=-1*twissfinal[2]*beam.getsigmaydy()/beam.getsigmay();
+  /*
+     if(myid==0)
+     {
+     for(int i1=0;i1<4;i1++)
+     cout<<twissfinal[i1]<<"  ";
+     cout<<endl;
+     }*/
+  for(int ii=0;ii<4;ii=ii+2)
+  {
+    fittemp+=abs(twissfinal[ii]-twiss_Out[ii])/twiss_Out[ii];
+  }
+  for(int ii=1;ii<4;ii=ii+2)
+  {
+    fittemp+=abs(twissfinal[ii]-twiss_Out[ii]);
+  }
+  fitness=(1/fittemp);
+  if(myid==0)
+    cout<<setw(10)<<fitness<<"  ";
+  for(int jj=0;jj<Mcount;jj++)
+  {
+    for(int ii=0;ii<4;ii++)
+    {
+      if(Param[jj][ii]<limit1[ii]||Param[jj][ii]>limit2[ii])
+      {
+	fitness=fitness*0.8;
+	//cout<<"aooo~~"<<Param[jj][ii]<<"   "<<limit2[ii]<<endl;
+      }
+    }
+  }
+  MPI_Bcast(&fitness,1,MPI_DOUBLE,0,MPI_COMM_WORLD);
+  MPI_Barrier(MPI_COMM_WORLD);
+  //  if(myid==0)
+  //    cout<<"F  "<<fitness<<endl;
+  v.fitness=fitness;
+  Mcount=tempM;
+}
+
+
+void Mapmain::GLfitness2(LatticeMap &v)
+{
+  double twisstemp[4],twissfinal[4];
+  double fittemp=0,fitness;
+  int tempM=Mcount;
+  lattice1=v;
+  Mcount=lattice1.ELE.size();
+  twisstrack(twiss_In[1],twiss_In[2],twiss_In[4],twiss_In[5]);
+  twissfinal[0]=Twiss_X(0);
+  twissfinal[1]=Twiss_X(1);
+  twissfinal[2]=Twiss_Y(0);
+  twissfinal[3]=Twiss_Y(1);
+  /*
+     for(int ii=0;ii<4;ii=ii+1)
+     {
+     cout<<twiss_In[ii]<<"  "<<twissfinal[ii]<<" "<<ii<<"  aaa\n";
+     }
+     cout<<endl;
+     */
+
+  for(int ii=0;ii<4;ii=ii+2)
+  {
+    fittemp+=abs(twissfinal[ii]-twiss_Out[ii])/twiss_Out[ii];
+  }
+  for(int ii=1;ii<4;ii=ii+2)
+  {
+    fittemp+=abs(twissfinal[ii]-twiss_Out[ii]);
+  }
+  fitness=(1/fittemp);
+  v.fitness=fitness;
+  //cout<<"F  "<<fitness<<"  "<<v.fitness<<endl;
+  Mcount=tempM;
+}
+
+void Mapmain::GLfitness3(LatticeMap &v)
+{
+  double PhaseEnd_X,PhaseEnd_Y;
+  double fittemp=0,fitness;
+  int tempM=Mcount;
+  lattice1=v;
+  Mcount=lattice1.ELE.size();
+  twisstrack(twiss_In[1],twiss_In[2],twiss_In[4],twiss_In[5]);
+  PhaseEnd_X=PhaseNow_X;
+  PhaseEnd_Y=PhaseNow_Y;
+  fittemp+=abs(PhaseEnd_X-PhaseExpect_X)/PhaseExpect_X;
+  fittemp+=abs(PhaseEnd_Y-PhaseExpect_Y)/PhaseExpect_Y;
+  fitness=(1/fittemp);
+  //cout<<"F  "<<fitness<<endl;
+  v.fitness=fitness;
+  Mcount=tempM;
+}
+
+void Mapmain::GLfitness4(LatticeMap &v)
+{
+  double PhaseEnd_X,PhaseEnd_Y;
+  double fittemp=0,fitness;
+  int tempM=Mcount;
+  lattice1=v;
+  Mcount=lattice1.ELE.size();
+  caculate();
+  if(getbetax()>0&&getbetay()>0&&getbetax()<1e8&&getbetay()<1e8)
+  {
+    twisstrack(getbetax(),getalphax(),getbetay(),getalphay());
+    PhaseEnd_X=PhaseNow_X;
+    PhaseEnd_Y=PhaseNow_Y;
+    fittemp+=abs(PhaseEnd_X-PhaseExpect_X)/PhaseExpect_X;
+    fittemp+=abs(PhaseEnd_Y-PhaseExpect_Y)/PhaseExpect_Y;
+    fitness=(1/fittemp);
+    //cout<<"F  "<<PhaseEnd_X<<"  "<<PhaseEnd_Y<<endl;
+    v.fitness=fitness;
+  }
+  else
+  {
+    v.fitness=0;
+    return;
+  }
+  Mcount=tempM;
+}
+
+
+//TwissTrack start
+void Mapmain::twisstrack(double betatmp, double alphatmp,char a,int enumber)
+{
+  if(enumber==0)
+    enumber=Mcount;
+  double PhaseAdvance=0,PhaseNow=0;
+  string address;
+  if(a=='x')
+  {address="twissx.dat";}
+  else if(a=='y')
+  {address="twissy.dat";}
+  ofstream twissout(address);
+  twissout<<setprecision(6)<<fixed;
+  this->alpha= alphatmp;
+  this->beta = betatmp;
+  gamma=(1+alpha*alpha)/beta;
+  twiss<<beta,alpha,gamma;
+  twissout<<setw(10)<<0<<"  "<<twiss.transpose()<<endl;
+  location.clear();
+  location.resize(enumber+1);
+  for(j=0;j<enumber;j++)
+  {
+    if(a=='x')
+    {
+      twiss=twissmapx(lattice1.Mat[j])*twiss;
+      //PhaseAdvance=GetPhaseAdvance_X(lattice1.Mat[j]);
+    }
+    else if(a=='y')
+    {
+      twiss=twissmapy(lattice1.Mat[j])*twiss;
+      //PhaseAdvance=GetPhaseAdvance_Y(lattice1.Mat[j]);
+    }
+    PhaseAdvance=1/twiss(0)*lattice1.ELE[j].p[2]/1000;
+    PhaseNow+=PhaseAdvance;
+    location[j+1]=location[j]+lattice1.ELE[j].p[2];
+    twissout<<setw(10)<<lattice1.ELE[j].name<<setw(10)<<location[j+1]<<"  ";
+    twissout<<setw(10)<<twiss.transpose()<<"  "<<PhaseNow<<endl;
+  }//for end
+  twissout.close();
+}
+
+void Mapmain::twisstrack(double betaxtmp, double alphaxtmp,double betaytmp,double alphaytmp,int enumber)
+{
+  if(enumber==0)
+    enumber=Mcount;
+  PhaseNow_X=0;
+  PhaseNow_Y=0;
+  ofstream twissout("twiss.dat");
+  TAlphax= alphaxtmp;
+  TBetax = betaxtmp;
+  TGammax=(1+TAlphax*TAlphax)/TBetax;
+  Twiss_X<<TBetax,TAlphax,TGammax;
+  TAlphay=alphaytmp;
+  TBetay=betaytmp;
+  TGammay=(1+TAlphay*TAlphay)/TBetay;
+  Twiss_Y<<TBetay,TAlphay,TGammay;
+  twissout<<setprecision(3)<<fixed;
+  twissout<<setw(6)<<"START"<<"  "<<setw(7)<<0<<"  ";
+  twissout<<setprecision(6)<<fixed;
+  twissout<<setw(10)<<Twiss_X.transpose()<<"  "<<setw(7)<<PhaseNow_X<<"  ";
+  twissout<<setw(10)<<Twiss_Y.transpose()<<"  "<<setw(7)<<PhaseNow_Y<<endl;
+  location.clear();
+  location.resize(enumber+1);
+  for(int j=0;j<lattice1.Mat.size();j++)
+  {
+    Twiss_X=twissmapx(lattice1.Mat[j])*Twiss_X;
+    Twiss_Y=twissmapy(lattice1.Mat[j])*Twiss_Y;
+    PhaseAdvance_X=1/Twiss_X(0)*lattice1.ELE[j].p[2]/1000;
+    PhaseAdvance_Y=1/Twiss_Y(0)*lattice1.ELE[j].p[2]/1000;
+    PhaseNow_X+=PhaseAdvance_X;
+    PhaseNow_Y+=PhaseAdvance_Y;
+    location[j+1]=location[j]+lattice1.ELE[j].p[2];
+    twissout<<setprecision(3)<<fixed;
+    twissout<<setw(6)<<lattice1.ELE[j].name<<"  "<<setw(7)<<location[j+1]/1000<<"  ";
+    twissout<<setprecision(6)<<fixed;
+    twissout<<setw(10)<<Twiss_X.transpose()<<"  "<<setw(7)<<PhaseNow_X<<"  ";
+    twissout<<setw(10)<<Twiss_Y.transpose()<<"  "<<setw(7)<<PhaseNow_Y<<endl;
+  }
+  twissout.close();
+}
+
+
+//Track end
+double Mapmain::GetPhaseAdvance_X(const MatrixXd &R)
+{
+  return acos(1.0/2*(R(0,0)+R(1,1)))*180/M_PI;
+}
+double Mapmain::GetPhaseAdvance_Y(const MatrixXd &R)
+{
+  return acos(1.0/2*(R(2,2)+R(3,3)))*180/M_PI;
+}
+double Mapmain::GetPhaseAdvance_Z(const MatrixXd &R)
+{
+  return acos(1.0/2*(R(4,4)+R(5,5)))*180/M_PI;
+}
+
+//Twisstrack end
+//=========================================
+//Particle track start
+
+
+
+void Mapmain::preparticle(const string &p)
+{
+  ifstream particlesinput(p);
+  totalparticlenumber=getlinenumber(p);
+  char addressout[99];
+  if(access("temp",0)!=0)
+    mkdir("temp",0755);
+
+  if(numprocs==1)
+  {
+    cout<<"Only one process\n";
+    sprintf(addressout, "temp/particlesdata0_0.dat");
+    ofstream particletemp(addressout);
+    while(particlesinput.peek()!=EOF)
+    {
+      getline(particlesinput,pline);
+      particletemp<<pline<<endl;
+    }
+    particletemp.close();
+    particlesinput.close();
+    return;
+  }
+  else if(numprocs>1)
+  {
+    //cout<<"particles is moving on "<<myid<<" of "<<numprocs<<" on "<<processor_name<<endl;
+    int temp=totalparticlenumber/(numprocs-1);
+    //cout<<"P number in one thread id  "<<temp<<endl;
+    for(i=1;i<numprocs;i++)
+    {
+      sprintf(addressout, "temp/particlesdata%d_0.dat", i);
+      ofstream particletemp(addressout);
+      for(j=(i-1)*temp;j<(i)*temp;j++)
+      {
+	getline(particlesinput,pline);
+	particletemp<<pline<<endl;
+      }
+      if(i==numprocs-1)
+      {
+	while(particlesinput.peek()!=EOF)
+	{
+	  getline(particlesinput,pline);
+	  particletemp<<pline<<endl;
+	}
+      }
+      particletemp.close();
+    }
+    particlesinput.close();
+    return;
+  }
+}
+
+void Mapmain::particleread(const string &p)
+{
+  beam.clear();
+  cout<<"THe particle data PATH is :    "<<p<<"  "<<getlinenumber(p)<<endl;
+  beam.initial('p',EGammaIni,getlinenumber(p));
+  ifstream particlesinput(p);
+  if(!particlesinput.is_open())
+  {  
+    cout<<"Error!Particle cannot readin!"<<endl;
+    return;
+  }
+  vector<string> para;
+  particle_count=0;
+  double a[6];
+  while(getline(particlesinput,pline)){
+    StringSplit(pline,para);
+    for(int r441=0; r441<para.size();r441++)
+    {
+      a[r441]=stod(para[r441]);
+    }
+    beam.setparticle(particle_count,a[0],a[1]/(EBetaIni*C_light),a[2],a[3]/(EBetaIni*C_light),a[4],a[5]/(EBetaIni*C_light));
+    //beam.setparticle(particle_count,a[0],a[1],a[2],a[3],a[4],a[5]);
+    //cout<<EBetaIni*C_light<<"  "<<a[1]/(EBetaIni*C_light)<<"  "<<a[2]<<"  "<<a[3]/(EBetaIni*C_light)<<"  "<<a[4]<<"  "<<a[5]/(EBetaIni*C_light)<<endl;
+    //if(myid==0)
+    //cout<<a[0]<<"   "<<a[1]<<endl;
+    particle_count++;
+  }
+  beam.caculate_emittance();
+  //cout<<"emittance(x,y,x+y)  "<<beam.getemittancex()<<"  "<<beam.getemittancey()<<"  "<<beam.getemittancex()+beam.getemittancey()<<"  correlation(x,y)  "<<beam.getcorrelationx()<<" "<<beam.getcorrelationy()<<"  sigma(x,y)  "<<beam.getsigmax()<<"  "<<beam.getsigmay()<<endl;
+  particlesinput.close();
+}
+
+
+//--------------------------
+
+void Mapmain::ptrackonce()
+{
+  particleread("particles.dat");
+  if(access("particledata",0)!=0)
+    mkdir("particledata",0755);
+  ofstream particlesoutput("particledata/particlesfinal.dat");
+  int temp_ptrack=0;
+  for(int c1=0;c1<particle_count;c1++)
+  {
+    VectorXd XYZ(6);
+    XYZ<<beam.getparticle(c1).getlocationx(),beam.getparticle(c1).getdirectionx(),beam.getparticle(c1).getlocationy(),beam.getparticle(c1).getdirectiony(),beam.getparticle(c1).getlocationz(),beam.getparticle(c1).getdirectionz();
+    XYZ=R1*XYZ;
+    particlesoutput<<XYZ.transpose()<<endl;
+    temp_ptrack++;
+  }
+  particlesoutput.close();
+
+  cout<<"particlefinal data had been saved in folder \"particledata\""<<endl;
+}
+//-------------------------------------------
+void Mapmain::ptrackall(int spcflag,char *p)
+{
+  char addressin[99];
+  char addressout[99];
+  VectorXd XYZ(6);
+  MPI_Bcast(&totalparticlenumber,1,MPI_INT,0,MPI_COMM_WORLD);
+  MPI_Barrier(MPI_COMM_WORLD);
+  if(myid==0)
+  {
+    //cout<<"particles is moving on "<<myid<<" of "<<numprocs<<" on "<<processor_name<<endl;
+    if(access("particledata",0)!=0)
+      mkdir("particledata",0755);
+    if(access("temp",0)!=0)
+      mkdir("particledata",0755);
+  }
+  ofstream emittanceout;
+  emittanceout.precision(8);
+  if(myid==0)
+    emittanceout.open("emittance.dat");
+
+  if(myid==0)
+  {
+    particleread(p);
+  }
+  else
+  {
+    sprintf(addressin,"temp/particlesdata%d_%d.dat",myid,0);
+    particleread(addressin);
+  }
+
+  double * pinf	=	new double[particle_count*6];
+  double * pinfall=	new double[totalparticlenumber*6];
+  int *pnumseq	=	new int[numprocs];
+  int *displa	=	new int[numprocs];
+  //cout<<totalparticlenumber<<endl;
+  double phasex=0,phasey=0,phasez=0;
+
+  if(myid==0)
+  {
+    emittanceout<< setw(6)  <<"START"<<" "
+      << setw(6)  <<0<<" "
+      << setw(12) << beam.getemittancex()<< " "
+      << setw(12) << beam.getemittancey()<<" "
+      << setw(12) << sqrt(beam.getsigmax())<<" "
+      << setw(12) << beam.getsigmadx()<<" "
+      << setw(12) << sqrt(beam.getsigmay())<<  " "
+      << setw(12) << beam.getsigmady()<< " "
+      << setw(12) << beam.getsigmaz()<<" "
+      << setw(12) << beam.getsigmadz()<<" "
+      << setw(12) << beam.getTBetax()<<" "
+      << setw(12) << beam.getTAlphax()<<" "
+      << setw(12) << beam.getTBetay()<<" "
+      << setw(12) << beam.getTAlphay()<<" "
+      << setw(12) << beam.getTBetaz()<<" "
+      << setw(12) << beam.getTAlphaz()<<" "
+      << setw(12) << phasex<<" "
+      << setw(12) << phasey<<" "
+      << setw(12) << phasez
+      <<endl;
+    location.clear();
+    location.resize(lattice1.Mat.size()+1);
+  }
+  //here
+  for(_ELECOUNT=0;_ELECOUNT<Mcount;_ELECOUNT++)
+  {
+    MPI_Barrier(MPI_COMM_WORLD);
+    ofstream particlesoutput;
+    if(ParamFlag)
+    {
+      if(numprocs>1)
+      {
+      sprintf(addressout,"temp/particlesdata%d_%d.dat",myid,_ELECOUNT+1);
+      if(myid>0)
+      {
+	particlesoutput.open(addressout);
+      }
+     
+      particlesoutput.precision(8);
+      }else if(numprocs==1)
+      {
+        sprintf(addressout,"MapData/particlestrack%d.dat",_ELECOUNT+1);
+	particlesoutput.open(addressout);
+      }
+    }
+
+    if(numprocs==1)
+    {
+      for(int c1=0;c1<beam.particleLIVEnumber;c1++)
+      {
+	XYZ<<	beam.getparticle(c1).getlocationx(),
+	  beam.getparticle(c1).getdirectionx(),
+	  beam.getparticle(c1).getlocationy(),
+	  beam.getparticle(c1).getdirectiony(),
+	  beam.getparticle(c1).getlocationz(),
+	  beam.getparticle(c1).getdirectionz();
+	if(lattice1.ELE[_ELECOUNT].name=="gap")
+	{
+	  double Shift=lattice1.EBeta[_ELECOUNT]*C_light/(lattice1.ELE[_ELECOUNT].p[6]*1e6)*1000;	//mm
+	  //cout<<Shift/2<<"     CCCC     "<<C_light/(lattice1.ELE[_ELECOUNT].p[6]*1e6)*1000<<endl;
+	  double temp=0;
+	  for(;XYZ(4)>Shift/2;)
+	  {
+	    XYZ(4)=XYZ(4)-Shift;
+	    temp+=Shift;
+	    //    if(myid==1)
+	    //   cout<<XYZ(4)<<endl;
+	  }
+	  for(;XYZ(4)<-Shift/2;)
+	  {
+	    XYZ(4)=XYZ(4)+Shift;
+	    double aa=XYZ(4);
+	    temp-=Shift;
+	    //   if(myid==1)
+	    //   cout<<XYZ(4)<<endl;
+	  }
+	  XYZ=lattice1.getMat(_ELECOUNT,XYZ(0),XYZ(1),XYZ(2),XYZ(3),XYZ(4),XYZ(5))*XYZ;
+	  XYZ(4)+=temp;
+	}
+	else
+	{
+	  XYZ=lattice1.getMat(_ELECOUNT,XYZ(0),XYZ(1),XYZ(2),XYZ(3),XYZ(4),XYZ(5))*XYZ;
+	}
+
+	beam.setparticle(c1,XYZ(0),XYZ(1),XYZ(2),XYZ(3),XYZ(4),XYZ(5));//to be change
+
+	if((BEAMLOSE==1)&&(!(abs(XYZ(0))<lattice1.ELE[_ELECOUNT].p[3]&&abs(XYZ(2))&&XYZ(2)>-lattice1.ELE[_ELECOUNT].p[3]&&abs(XYZ(1))<1e9&&abs(XYZ(3))<1e9)))
+	{
+	  beam.setlost(c1,_ELECOUNT);
+	  c1--;
+	}
+	else
+	{
+	  if(ParamFlag)
+	  {
+	    for(int i=0;i<3;i++)
+	    {
+	      particlesoutput<<setw(10)<<XYZ(2*i)<<"\t";
+	      particlesoutput<<setw(10)<<XYZ(2*i+1)<<"\t";
+	    }
+	    particlesoutput<<endl;
+	  }
+	}
+      }
+    }
+    else if(myid>0)
+    {
+      for(int c1=0;c1<beam.particleLIVEnumber;c1++)
+      {
+	XYZ<<	beam.getparticle(c1).getlocationx(),
+	  beam.getparticle(c1).getdirectionx(),
+	  beam.getparticle(c1).getlocationy(),
+	  beam.getparticle(c1).getdirectiony(),
+	  beam.getparticle(c1).getlocationz(),
+	  beam.getparticle(c1).getdirectionz();
+	if(lattice1.ELE[_ELECOUNT].name=="gap")
+	{
+	  double Shift=lattice1.EBeta[_ELECOUNT]*C_light/(lattice1.ELE[_ELECOUNT].p[6]*1e6)*1000;	//mm
+	  double temp=0;
+	  for(;XYZ(4)>Shift/2;)
+	  {
+	    XYZ(4)=XYZ(4)-Shift;
+	    temp+=Shift;
+	    //    if(myid==1)
+	    //   cout<<XYZ(4)<<endl;
+	  }
+	  for(;XYZ(4)<-Shift/2;)
+	  {
+	    XYZ(4)=XYZ(4)+Shift;
+	    temp-=Shift;
+	    //   if(myid==1)
+	    //   cout<<XYZ(4)<<endl;
+	  }
+	  XYZ=lattice1.getMat(_ELECOUNT,XYZ(0),XYZ(1),XYZ(2),XYZ(3),XYZ(4),XYZ(5))*XYZ;
+	  XYZ(4)+=temp;
+	}
+	else
+	{
+	  XYZ=lattice1.getMat(_ELECOUNT,XYZ(0),XYZ(1),XYZ(2),XYZ(3),XYZ(4),XYZ(5))*XYZ;
+	}
+	beam.setparticle(c1,XYZ(0),XYZ(1),XYZ(2),XYZ(3),XYZ(4),XYZ(5));
+	if((BEAMLOSE==1)&&(!(abs(XYZ(0))<lattice1.ELE[_ELECOUNT].p[3]&&abs(XYZ(2))&&XYZ(2)>-lattice1.ELE[_ELECOUNT].p[3]&&abs(XYZ(1))<1e9&&abs(XYZ(3))<1e9)))
+	{
+	  beam.setlost(c1,_ELECOUNT);
+	  c1--;
+	}
+	else
+	{
+	  for(int i23=0;i23<6;i23++)
+	  {
+	    pinf[c1*6+i23]=XYZ(i23);
+	  }
+	  if(ParamFlag)
+	  {
+	    for(int i=0;i<3;i++)
+	    {
+	      particlesoutput<<setw(10)<<XYZ(2*i)<<"\t";
+	      particlesoutput<<setw(10)<<XYZ(2*i+1)<<"\t";
+	    }
+	    particlesoutput<<endl;
+	  }
+	}
+      }
+    }
+
+    if(spcflag)
+    {
+      if(numprocs!=1)
+      {
+	MPI_Barrier(MPI_COMM_WORLD);
+	particle_count=beam.particleLIVEnumber;
+	int temp1=particle_count*6;
+	MPI_Gather(&temp1,1,MPI_INT,pnumseq,1,MPI_INT,0,MPI_COMM_WORLD);
+	if(myid==0)
+	{
+	  displa[0]=0;
+	  displa[1]=0;
+	  for(i=2;i<numprocs;i++)
+	  {
+	    displa[i]=displa[i-1]+pnumseq[i-1];
+	  }
+	  totalparticlenumber=0;
+	  for(i=1;i<numprocs;i++)
+	  {
+	    totalparticlenumber+=pnumseq[i]/6;
+	  }
+	}
+	MPI_Barrier(MPI_COMM_WORLD);
+	MPI_Gatherv(pinf,particle_count*6,MPI_DOUBLE,pinfall,pnumseq,displa,MPI_DOUBLE,0,MPI_COMM_WORLD);
+	MPI_Barrier(MPI_COMM_WORLD);
+	if(myid==0)
+	{
+	  beam.initial('e',lattice1.EGamma[_ELECOUNT],totalparticlenumber);
+	  for(int c1=0;c1<totalparticlenumber;c1++)
+	  {
+	    beam.setparticle(c1,pinfall[c1*6],pinfall[c1*6+1],pinfall[c1*6+2],pinfall[c1*6+3],pinfall[c1*6+4],pinfall[c1*6+5]);
+	  }
+	  //        sprintf(addressout,"test/particlestestdata%d_%d.dat",myid,_ELECOUNT+1);
+	  //        beam.output(addressout);
+
+	  spacechargepre();
+	}
+      }
+      else if(numprocs==1)
+      {
+	spacechargepre();
+      }
+
+
+      MPI_Barrier(MPI_COMM_WORLD);
+      MPI_Bcast(muspace,3,MPI_DOUBLE,0,MPI_COMM_WORLD);
+      MPI_Bcast(&X,1,MPI_DOUBLE,0,MPI_COMM_WORLD);
+      MPI_Bcast(&Y,1,MPI_DOUBLE,0,MPI_COMM_WORLD);
+      MPI_Bcast(&Z,1,MPI_DOUBLE,0,MPI_COMM_WORLD);
+      MPI_Barrier(MPI_COMM_WORLD);
+      spacechargepromote(lattice1.ELE[_ELECOUNT].p[2]);
+    }
+
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    if(numprocs!=1)
+    {
+      int temp1=particle_count*6;
+      MPI_Gather(&temp1,1,MPI_INT,pnumseq,1,MPI_INT,0,MPI_COMM_WORLD);
+      if(myid==0)
+      {
+	displa[0]=0;
+	displa[1]=0;
+	for(i=2;i<numprocs;i++)
+	{
+	  displa[i]=displa[i-1]+pnumseq[i-1];
+	}
+      }
+      MPI_Barrier(MPI_COMM_WORLD);
+      MPI_Gatherv(pinf,particle_count*6,MPI_DOUBLE,pinfall,pnumseq,displa,MPI_DOUBLE,0,MPI_COMM_WORLD);
+      MPI_Barrier(MPI_COMM_WORLD);
+
+      if(myid==0)
+      {
+	for(int c1=0;c1<totalparticlenumber;c1++)
+	{
+	  beam.setparticle(c1,pinfall[c1*6],pinfall[c1*6+1],pinfall[c1*6+2],pinfall[c1*6+3],pinfall[c1*6+4],pinfall[c1*6+5]);
+	}
+      }
+    }
+    if(myid==0)
+      beam.caculate_emittance();
+    emittanceout<<setprecision(8);
+    if(myid==0)
+    {
+      if(!ParamFlag)
+      {
+	Param[_ELECOUNT][0]=sqrt(beam.getsigmax())*2;
+	Param[_ELECOUNT][1]=sqrt(beam.getemittancex()/beam.getsigmax())*2;
+	Param[_ELECOUNT][2]=sqrt(beam.getsigmay())*2;
+	Param[_ELECOUNT][3]=sqrt(beam.getemittancey()/beam.getsigmay())*2;
+      }
+      location[_ELECOUNT+1]=location[_ELECOUNT]+lattice1.ELE[_ELECOUNT].p[2];
+      phasex+=lattice1.ELE[_ELECOUNT].p[2]/beam.getTBetax();
+      phasey+=lattice1.ELE[_ELECOUNT].p[2]/beam.getTBetay();
+      phasez+=lattice1.ELE[_ELECOUNT].p[2]/beam.getTBetaz();
+
+
+      emittanceout<< setw(6)  <<lattice1.ELE[_ELECOUNT].name<<" "
+	<< setw(6)  <<location[_ELECOUNT+1]<<" "
+	<< setw(12) << beam.getemittancex()<< " "
+	<< setw(12) << beam.getemittancey()<<" "
+	<< setw(12) << sqrt(beam.getsigmax())<<" "
+	<< setw(12) << beam.getsigmadx()<<" "
+	<< setw(12) << sqrt(beam.getsigmay())<<  " "
+	<< setw(12) << beam.getsigmady()<< " "
+	<< setw(12) << beam.getsigmaz()<<" "
+	<< setw(12) << beam.getsigmadz()<<" "
+	<< setw(12) << beam.getTBetax()<<" "
+	<< setw(12) << beam.getTAlphax()<<" "
+	<< setw(12) << beam.getTBetay()<<" "
+	<< setw(12) << beam.getTAlphay()<<" "
+	<< setw(12) << beam.getTBetaz()<<" "
+	<< setw(12) << beam.getTAlphaz()<<" "
+	<< setw(12) << phasex<<" "
+	<< setw(12) << phasey<<" "
+	<< setw(12) << phasez
+	<<endl;
+    }
+    MPI_Barrier(MPI_COMM_WORLD);
+    particlesoutput.close();
+  }//for end
+
+
+
+
+
+
+
+  if(DEBUG==1&&myid==0)
+    emittanceout<< setw(6)  <<lattice1.ELE[_ELECOUNT-1].name<<" "
+      << setw(6)  <<location[_ELECOUNT]<<" "
+      << setw(12) << beam.getemittancex()<< " "
+      << setw(12) << beam.getemittancey()<<" "
+      << setw(12) << sqrt(beam.getsigmax())<<" "
+      << setw(12) << beam.getsigmadx()<<" "
+      << setw(12) << sqrt(beam.getsigmay())<<  " "
+      << setw(12) << beam.getsigmady()<< " "
+      << setw(12) << beam.getsigmaz()<<" "
+      << setw(12) << beam.getsigmadz()<<" "
+      << setw(12) << beam.getTBetax()<<" "
+      << setw(12) << beam.getTAlphax()<<" "
+      << setw(12) << beam.getTBetay()<<" "
+      << setw(12) << beam.getTAlphay()<<" "
+      << setw(12) << beam.getTBetaz()<<" "
+      << setw(12) << beam.getTAlphaz()<<" "
+      << setw(12) << phasex<<" "
+      << setw(12) << phasey<<" "
+      << setw(12) << phasez
+      <<endl;
+  if(pinfall!=NULL)
+  { 
+    delete [] pinfall;
+    pinfall=NULL;
+  }
+  if(pinf!=NULL)
+  {
+    delete [] pinf;
+    pinf=NULL;
+  }
+  emittanceout.close();
+  //if(myid==0)
+  //cout<<"particle track data had been saved in folder \"particledata\""<<endl;
+}
+
+void Mapmain::postparticle()
+{
+  if(numprocs==1)
+  {
+    cout<<"Only one process\n";
+    return;
+  }
+  char addressin[99],addressout[99];
+  int t=Mcount/numprocs,nstart,nend;
+  if(myid!=numprocs-1)
+  {
+    nstart=myid*t;
+    nend=(myid+1)*t;
+  }
+  else if(myid==numprocs-1)
+  {
+    nstart=myid*t;
+    nend=Mcount+1;
+  }
+  for(j=nstart;j<nend;j++)
+  {
+    sprintf(addressout, "particledata/particlestrack%d.dat", j);
+    ofstream particletemp(addressout);
+    for(i=0;i<numprocs;i++)
+    {
+      sprintf(addressin, "temp/particlesdata%d_%d.dat", i,j);
+      ifstream particlesinput(addressin);
+      while(particlesinput.peek()!=EOF)
+      {
+	getline(particlesinput,pline);
+	particletemp<<pline<<endl;
+      }
+      particlesinput.close();
+      remove(addressin);
+    }
+    particletemp.close();
+  }
+}
+//Particle track end
+//=========================================
+
+void Mapmain::spacechargepromote(double length)
+{
+  MPI_Barrier(MPI_COMM_WORLD);
+  if(numprocs==1||myid>0)
+  {
+    ofstream out("spacechargerecorder.dat",ios::app);
+    double x,y,z,px,py,pz,Ex,Ey,Ez;
+    double w1,w2,dw,p1,p2,pxt,pyt,pzt;
+    double IT=totalparticlenumber*_Q;
+    gam=lattice1.EGamma[_ELECOUNT];
+    double ebeta=lattice1.EBeta[_ELECOUNT];
+    length=length/1000;
+    cout <<setiosflags(ios::scientific);
+    for(int countspc=0;countspc<beam.particleLIVEnumber;countspc++)
+    {
+      if(countspc<5&&myid==0)
+      {
+	out<<beam.getparticle(countspc).getlocationx()<<endl;
+      }
+      Ex=3*IT*beam.getparticle(countspc).getlocationx()/(4*M_PI*Epsilon*gam*gam*X*Y*Z)*muspace[0];
+      Ey=3*IT*beam.getparticle(countspc).getlocationy()/(4*M_PI*Epsilon*gam*gam*X*Y*Z)*muspace[1];
+      Ez=3*IT*beam.getparticle(countspc).getlocationz()/(4*M_PI*Epsilon*gam*gam*X*Y*Z)*muspace[2];
+      pxt=beam.getparticle(countspc).getdirectionx()+_Q*Ex/_MASS*length/(ebeta*C_light)/(ebeta*C_light)*1000;
+      pyt=beam.getparticle(countspc).getdirectiony()+_Q*Ey/_MASS*length/(ebeta*C_light)/(ebeta*C_light)*1000;
+
+      p1=(beam.getparticle(countspc).getdirectionz()/1000+1)*gam*ebeta*_MASS*C_light;
+      w1=sqrt(p1*C_light*p1*C_light+(_MASS*C_light*C_light)*(_MASS*C_light*C_light));
+      w2=w1+_Q*Ez*length;
+      p2=sqrt(w2*w2-(_MASS*C_light*C_light)*(_MASS*C_light*C_light))/C_light;
+      pzt=(p2/(gam*ebeta*_MASS*C_light)-1)*1000;
+      //pz=beam.getparticle(countspc).getdirectionz()+_Q*Ez/_MASS*length/(beam.getbeta_beam_energy()*C_light)/(beam.getbeta_beam_energy()*C_light)*1000;
+
+      x=beam.getparticle(countspc).getlocationx()+_Q*Ex/_MASS*length/(beam.getbeta_beam_energy()*C_light)/(beam.getbeta_beam_energy()*C_light)/2*length;
+      y=beam.getparticle(countspc).getlocationy()+_Q*Ey/_MASS*length/(beam.getbeta_beam_energy()*C_light)/(beam.getbeta_beam_energy()*C_light)/2*length;
+      z=beam.getparticle(countspc).getlocationz()+(pzt-beam.getparticle(countspc).getdirectionz())/1000*length/gam/gam;
+      px=pxt;
+      py=pyt;
+      pz=pzt;
+      //z=beam.getparticle(countspc).getlocationz()+_Q*Ez/_MASS*length/(beam.getbeta_beam_energy()*C_light)/(beam.getbeta_beam_energy()*C_light)/2*length;
+      /*if(_ELECOUNT==10&&myid==1)
+	{ 
+	cout<<endl;
+	cout<<_ELECOUNT<<"  "<<countspc<<endl;
+	cout<<_Q*Ex/_MASS*length/(ebeta*C_light)/(ebeta*C_light)*1000<<endl;
+	cout<<beam.getparticle(countspc).getdirectionz()<<"  "<<pzt<<endl;
+	cout<<p1<<" P "<<p2<<endl;
+	cout<<w1<<" W "<<w2<<endl;
+	cout<<gam<<"  "<<ebeta<<"  "<<_MASS*C_light<<endl;
+	cout<<x<<" XYZ "<<y<<"   "<<z<<endl;
+	cout<<px<<" PXYZ  "<<py<<"   "<<pz<<endl;
+	cout<<pxt<<" PXYZT "<<pyt<<"   "<<pzt<<endl;
+	}
+	if(pz<1e9&&(!(pzt<1e9)))
+	{
+	cout<<x<<" aXYZ "<<y<<"   "<<z<<endl;
+	cout<<px<<" aPXYZ  "<<py<<"   "<<pz<<endl;
+	cout<<pxt<<" aPXYZT "<<pyt<<"   "<<pzt<<endl;
+	}*/
+      beam.setparticle(countspc,x,px,y,py,z,pz);
+      if(countspc<5&&myid==0)
+      {
+	out<<beam.getparticle(countspc).getlocationx()<<endl;
+	out<<_Q*Ex/_MASS*length<<"   "<<(beam.getbeta_beam_energy()*C_light)<<"   "<<(beam.getbeta_beam_energy()*C_light)<<endl;
+	//    out<<x<<"  "<<px<<"  "<<Ex<<"  "<<y<<"  "<<py<<"  "<<Ey<<"  "<<z<<"  "<<pz<<"  "<<Ez<<"  at  "<<myid<<"  "<<countspc<<endl;
+	//out<<IT<<"   "<<beam.getparticle(countspc).getlocationx()<<"  "<<Epsilon<<"  "<<gam<<"  "<<X*Y*Z<<"  "<<muspace[0]<<endl;
+      }
+    }
+    //out<<"====="<<endl;
+    out.close();
+  }
+  MPI_Barrier(MPI_COMM_WORLD);
+}
+
+void Mapmain::spacechargepre()
+{
+  gam=lattice1.EGamma[_ELECOUNT];
+  beam.caculate_emittance();
+  X=sqrt(beam.getsigmax())*2;
+  Y=sqrt(beam.getsigmay())*2;
+  Z=sqrt(beam.getsigmaz())*2;
+  muspace[0]=X*Y*Z*gam/2*Romberg(1);
+  muspace[1]=X*Y*Z*gam/2*Romberg(2);
+  muspace[2]=X*Y*Z*gam/2*Romberg(3);
+  //cout<<"Romberg(1)  "<<Romberg(1)<<"  "<<muspace[0]<<"\n";
+}
+double Mapmain::scfunx(double em)
+{
+  return 1/(X*X+em)/sqrt((X*X+em)*(Y*Y+em)*(Z*Z*gam*gam+em));
+}
+double Mapmain::scfuny(double em)
+{
+  return 1/(Y*Y+em)/sqrt((X*X+em)*(Y*Y+em)*(Z*Z*gam*gam+em));
+}
+double Mapmain::scfunz(double em)
+{
+  return 1/(Z*Z*gam*gam+em)/sqrt((X*X+em)*(Y*Y+em)*(Z*Z*gam*gam+em));
+}
+double Mapmain::testfun(double a)
+{
+  return a*a;
+}
+//Romberg
+double Mapmain::Romberg(int type)
+{
+  double a=0;
+  double b=100000;
+  int COUNT=50;//been optimized to epsilon=0.000001
+  double epsilon=0.000001;
+  int m ,n;
+  double h,x,s,q,ep;
+  double p,*R =new double[COUNT];
+  h=b-a;
+  if(type==1)
+    R[0]= h*(scfunx(a)+ scfunx(b))/2.0;
+  else if(type==2)
+    R[0]= h*(scfuny(a)+ scfuny(b))/2.0;
+  else if(type==3)
+    R[0]= h*(scfunz(a)+ scfunz(b))/2.0;
+  else if(type==4)
+    R[0]= h*(testfun(a)+ testfun(b))/2.0;
+  m=1;
+  n=1;
+  ep=epsilon+1.0;
+  while ((ep >= epsilon)&& (m <COUNT))
+  {
+    p = 0.0;
+    for(int i=0;i<n;i++)
+    {
+      x = a+ (i+0.5)*h ;
+      if(type==1)
+	p= p + scfunx(x);
+      else if(type==2)
+	p= p + scfuny(x);
+      else if(type==3)
+	p= p + scfunz(x);
+      else if(type==4)
+	p= p + testfun(x);
+    }
+    p= (R[0]+ h*p)/2.0;
+    s = 1.0;
+    for(int k=1;k<=m;k++)
+    {
+      s = 4.0*s;
+      q= (s*p-R[k-1])/(s-1.0);
+      R[k-1]= p;
+      p =q;
+    }
+    ep=fabs(q -R[m-1]);
+    m =m + 1;
+    R[m-1]= q;
+    n = n + n;
+    h = h/2.0;
+  }
+  delete []R;
+  return (q);
+}
+
+
+double Mapmain::getalphax()
+{return beam.getTAlphax();}
+double Mapmain::getalphay()
+{return beam.getTAlphay();}
+double Mapmain::getbetax()
+{return beam.getTBetax();}
+double Mapmain::getbetay()
+{return beam.getTBetay();}
+double Mapmain::getgammax()
+{return beam.getTGammax();}
+double Mapmain::getgammay()
+{return beam.getTGammay();}
+

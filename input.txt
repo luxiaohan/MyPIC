@@ -1,0 +1,14 @@
+NumofGrid 	129 129 65
+particle	1  1		!numOfCharge,numofMass
+particlenumber	10000
+
+twissx		0.2e-6  1.15e-1  -1.31
+twissy		0.2e-6  1.29e-1  1.46
+twissz		0.16e-6  0.99  0
+
+energy		3.2  0.00001	!MeV,  !energy spread
+Current		0.015
+RFQ		325e6  4.66345
+
+StepPerCycle	100
+MaxStepNumber	1e5
